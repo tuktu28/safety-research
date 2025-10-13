@@ -7,9 +7,13 @@ import uuid
 from typing import List, Dict
 import time
 import urllib.parse 
+import logging
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError 
+
+# Set up basic logging (helpful for debugging security/network issues)
+logging.basicConfig(level=logging.INFO)
 
 # --- Configuration and Helpers ---
 
@@ -28,16 +32,9 @@ try:
 except KeyError:
     # IMPORTANT: The user must ensure their secrets.toml looks like this:
     # GEMINI_API_KEY = "YOUR_ACTUAL_KEY_HERE"
-    # Note the double quotes around the key value.
     st.error("""
         **Configuration Error:** `GEMINI_API_KEY` not found in Streamlit secrets. 
         Please configure it in your `.streamlit/secrets.toml` file.
-        
-        **Fix for the current error:** Ensure your file looks exactly like this:
-        ```toml
-        GEMINI_API_KEY = "AIzaSyBEgaJjSdxvshpAhRsuRgO6WKCJj-JpJE" 
-        ```
-        (The value must be enclosed in double quotes for Streamlit to parse it as a string.)
     """)
     st.stop() # Stop the script execution if the key is missing
 
@@ -45,20 +42,42 @@ except KeyError:
 client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
-# --- New Helper Function for URL Cleaning ---
+# --- More Robust Helper Function for URL Cleaning ---
 def clean_google_redirect_url(url: str) -> str:
     """
     Checks if a URL is a Google redirect (e.g., google.com/url?q=...) 
     and extracts the final, clean destination URL.
+    Also ensures the URL is properly decoded and secured (HTTPS).
     """
-    if "google.com/url?q=" in url:
-        # Parse the query string parameters
-        parsed_url = urllib.parse.urlparse(url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
-        # The actual destination is usually in the 'q' parameter
-        if 'q' in query_params and query_params['q']:
-            return query_params['q'][0]
-    return url
+    # 1. Decode any URL encoding issues
+    decoded_url = urllib.parse.unquote(url)
+
+    # 2. Check for Google Redirect pattern
+    if "google.com/url?q=" in decoded_url:
+        try:
+            parsed_url = urllib.parse.urlparse(decoded_url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            
+            # The actual destination is usually in the 'q' parameter
+            if 'q' in query_params and query_params['q']:
+                final_url = query_params['q'][0]
+                logging.info(f"Cleaned Google Redirect: {url} -> {final_url}")
+                decoded_url = final_url
+        except Exception as e:
+            logging.error(f"Error parsing Google URL: {e}")
+            pass # Keep the original URL if parsing fails
+
+    # 3. Ensure the scheme is HTTPS if it's currently HTTP
+    if decoded_url.startswith("http://") and "https://" not in decoded_url:
+        decoded_url = decoded_url.replace("http://", "https://", 1)
+    
+    # 4. Final validation: must start with https://
+    if not decoded_url.startswith("https://"):
+         # For URLs that are just paths or highly unusual, we log and skip.
+        logging.warning(f"URL did not start with https:// and was discarded: {decoded_url}")
+        return "" # Return empty string for invalid URL
+
+    return decoded_url
 
 
 # --- Gemini API Utilities (Refactored for Dynamic Fetching) ---
@@ -67,8 +86,8 @@ def clean_google_redirect_url(url: str) -> str:
 def fetch_more_articles() -> Dict:
     """Fetches a new batch of 10 articles using Google Search grounding and structured output (via SDK)."""
 
-    # --- PROMPT UPDATED TO REQUEST 10 ARTICLES FOR BATCH LOADING ---
-    SYSTEM_PROMPT = """You are an AI research assistant specializing in workplace safety, workers' compensation, and workplace technology. Your goal is to provide real-time, academic, and well-sourced information. You must perform a Google Search. Based on the search results (articles/papers), extract the top three, concise, high-level insights. Each insight must be 10 words or less. Also, provide a list of 10 search results containing their title, source (must be a plausible journal, organization, or news source), the **publicly browsable, full URL from the search result (MUST be the final destination link and must NOT be a Google redirect link like google.com/url?q=...)**, a recent publication date, and the **first 1-2 sentences of the article/paper's content (the snippet)**.
+    # --- PROMPT UPDATED to emphasize clean URLs ---
+    SYSTEM_PROMPT = """You are an AI research assistant specializing in workplace safety, workers' compensation, and workplace technology. Your goal is to provide real-time, academic, and well-sourced information. You must perform a Google Search. Based on the search results (articles/papers), extract the top three, concise, high-level insights. Each insight must be 10 words or less. Also, provide a list of 10 search results containing their title, source (must be a plausible journal, organization, or news source), the **publicly browsable, full, and clean destination URL that begins with 'https://' (MUST NOT be a Google redirect link)**, a recent publication date, and the **first 1-2 sentences of the article/paper's content (the snippet)**.
 
     CRITICAL INSTRUCTION: Your entire response must be ONLY a raw JSON object following this exact schema. DO NOT include any explanatory text, markdown formatting (like ```json), or wrapping text.
 
@@ -92,7 +111,6 @@ def fetch_more_articles() -> Dict:
         ]
     }
     """
-    # NOTE: The query remains the same, but the model is expected to find different results over time.
     USER_QUERY = "Recent papers, articles, and research on workers compensation insurance, workplace safety, AI in the workplace, and technology integration."
     
     config = types.GenerateContentConfig(
@@ -115,17 +133,22 @@ def fetch_more_articles() -> Dict:
             
         parsed_data = json.loads(json_text)
         
-        # Ensure articles have unique IDs, summary is null, and clean the URL
+        valid_articles = []
         for article in parsed_data.get('articles', []):
-            # FIX: Force a unique UUID for the article ID regardless of what the model returned
-            # This prevents the StreamlitDuplicateElementKey error by guaranteeing uniqueness.
-            article['id'] = str(uuid.uuid4())
-            article['summary'] = None
-            
-            # Clean up the URL (to fix broken links from Google redirects)
-            if 'url' in article and article['url']:
-                article['url'] = clean_google_redirect_url(article['url'])
-            
+            # 1. Clean the URL robustly
+            cleaned_url = clean_google_redirect_url(article.get('url', ''))
+
+            # 2. Only keep articles with a valid, secure URL
+            if cleaned_url:
+                # 3. Force a unique UUID
+                article['id'] = str(uuid.uuid4())
+                article['summary'] = None
+                article['url'] = cleaned_url
+                valid_articles.append(article)
+            else:
+                logging.warning(f"Discarding article due to invalid URL: {article.get('title')}")
+
+        parsed_data['articles'] = valid_articles
         return parsed_data
 
     except APIError as e:
@@ -207,17 +230,22 @@ def init_session_state():
                         'Hybrid work increases stress claims.', 
                         'Wearable tech drastically cuts injuries.'
                     ]
-                    # FIX: Use generated UUIDs for fallback data to prevent key errors
-                    st.session_state.articles = [
+                    # Fallback data, now using the robust URL cleaner
+                    fallback_articles = [
                         {'id': str(uuid.uuid4()), 'title': 'AI-Powered Risk Assessment in Manufacturing', 'source': 'Safety Journal', 'url': 'https://research-source-f1.com', 'date': 'Jan 2026', 'summary': None, 'snippet': 'This paper explores how artificial intelligence can significantly enhance risk detection.'},
                         {'id': str(uuid.uuid4()), 'title': 'The Psychological Cost of Remote Monitoring', 'source': 'Future Work Review', 'url': 'https://research-source-f2.com', 'date': 'Dec 2025', 'summary': None, 'snippet': 'New research suggests that constantly monitored remote workers face higher mental health claims.'},
                         {'id': str(uuid.uuid4()), 'title': 'Blockchain for Workers Comp Fraud Detection', 'source': 'FinTech Quarterly', 'url': 'https://research-source-f3.com', 'date': 'Nov 2025', 'summary': None, 'snippet': 'A new method using distributed ledger technology aims to dramatically reduce fraudulent workers compensation claims.'},
                     ]
 
-                    # FIX: Apply URL cleaning to fallback data to ensure link robustness
-                    for article in st.session_state.articles:
-                        if 'url' in article:
-                            article['url'] = clean_google_redirect_url(article['url'])
+                    # Apply URL cleaning to fallback data to ensure link robustness
+                    valid_fallbacks = []
+                    for article in fallback_articles:
+                        cleaned_url = clean_google_redirect_url(article.get('url', ''))
+                        if cleaned_url:
+                            article['url'] = cleaned_url
+                            valid_fallbacks.append(article)
+
+                    st.session_state.articles = valid_fallbacks
                             
                     st.session_state.display_count = len(st.session_state.articles)
                     st.warning("Could not fetch real-time data. Displaying fallback articles.")
@@ -273,7 +301,6 @@ def handle_load_more():
             new_articles = new_data['articles']
             
             # Use a set of existing URLs/Titles to check for duplicates
-            # Since URLs are cleaned in fetch_more_articles, this comparison is robust
             existing_identifiers = set(
                 (a['title'], a['url']) for a in st.session_state.articles
             )
@@ -333,7 +360,7 @@ def render_article_card(article: Dict):
     with col_sum:
         st.button(
             "✨ Summarize",
-            # The key uses the globally unique UUID to prevent the previous StreamlitDuplicateElementKey error
+            # The key uses the globally unique UUID to prevent the StreamlitDuplicateElementKey error
             key=f"sum_{article_id}",
             on_click=handle_summarize,
             args=(article_id,), 
