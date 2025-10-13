@@ -84,7 +84,10 @@ def clean_google_redirect_url(url: str) -> str:
 
 # REMOVED @st.cache_data to allow repeated fetching
 def fetch_more_articles() -> Dict:
-    """Fetches a new batch of 10 articles using Google Search grounding and structured output (via SDK)."""
+    """Fetches a new batch of 10 articles using Google Search grounding and structured output (via SDK).
+    
+    *** NEW: This function now also automatically generates the summary for each article. ***
+    """
 
     # --- PROMPT UPDATED to emphasize clean URLs ---
     SYSTEM_PROMPT = """You are an AI research assistant specializing in workplace safety, workers' compensation, and workplace technology. Your goal is to provide real-time, academic, and well-sourced information. You must perform a Google Search. Based on the search results (articles/papers), extract the top three, concise, high-level insights. Each insight must be 10 words or less. Also, provide a list of 10 search results containing their title, source (must be a plausible journal, organization, or news source), the **publicly browsable, full, and clean destination URL that begins with 'https://' (MUST NOT be a Google redirect link)**, a recent publication date, and the **first 1-2 sentences of the article/paper's content (the snippet)**.
@@ -134,6 +137,7 @@ def fetch_more_articles() -> Dict:
         parsed_data = json.loads(json_text)
         
         valid_articles = []
+        # --- Start Auto-Summarization Loop ---
         for article in parsed_data.get('articles', []):
             # 1. Clean the URL robustly
             cleaned_url = clean_google_redirect_url(article.get('url', ''))
@@ -142,14 +146,18 @@ def fetch_more_articles() -> Dict:
             if cleaned_url:
                 # 3. Force a unique UUID
                 article['id'] = str(uuid.uuid4())
-                article['summary'] = None
                 article['url'] = cleaned_url
+                
+                # 4. Auto-generate the summary
+                article['summary'] = generate_summary(article)
+
                 valid_articles.append(article)
             else:
                 logging.warning(f"Discarding article due to invalid URL: {article.get('title')}")
 
         parsed_data['articles'] = valid_articles
         return parsed_data
+        # --- End Auto-Summarization Loop ---
 
     except APIError as e:
         st.error(f"Gemini API Error during article fetch (Status 400/403/429): {e}")
@@ -179,19 +187,28 @@ def generate_summary(article: Dict) -> str:
         system_instruction=SYSTEM_PROMPT
     )
 
-    try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=USER_QUERY,
-            config=config
-        )
-        return response.text
-    except APIError as e:
-        st.error(f"Gemini API Error during summarization: {e}")
-        return "Summary generation failed due to API error."
-    except Exception as e:
-        st.error(f"Failed to generate summary: {e}")
-        return "Summary generation failed."
+    # Add a simple retry mechanism in case of transient API failures
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=USER_QUERY,
+                config=config
+            )
+            return response.text
+        except APIError as e:
+            if attempt < MAX_RETRIES - 1:
+                logging.warning(f"Summary API error, retrying in {2**attempt}s: {e}")
+                time.sleep(2**attempt)
+            else:
+                st.error(f"Gemini API Error during summarization after {MAX_RETRIES} attempts: {e}")
+                return "Summary generation failed due to API error."
+        except Exception as e:
+            st.error(f"Failed to generate summary: {e}")
+            return "Summary generation failed."
+
+    return "Summary generation failed."
 
 
 # --- State Initialization ---
@@ -211,7 +228,8 @@ def init_session_state():
     if not st.session_state.articles and not st.session_state.is_loading:
         st.session_state.is_loading = True
         try:
-            with st.spinner("Searching the web for the initial 10 articles..."):
+            # Note: This operation now takes longer due to auto-summarization
+            with st.spinner("Searching the web and generating summaries for initial articles..."):
                 data = fetch_more_articles() 
             
             if data and data.get('articles'):
@@ -230,11 +248,11 @@ def init_session_state():
                         'Hybrid work increases stress claims.', 
                         'Wearable tech drastically cuts injuries.'
                     ]
-                    # Fallback data, now using the robust URL cleaner
+                    # Fallback data, now including mock summaries
                     fallback_articles = [
-                        {'id': str(uuid.uuid4()), 'title': 'AI-Powered Risk Assessment in Manufacturing', 'source': 'Safety Journal', 'url': 'https://research-source-f1.com', 'date': 'Jan 2026', 'summary': None, 'snippet': 'This paper explores how artificial intelligence can significantly enhance risk detection.'},
-                        {'id': str(uuid.uuid4()), 'title': 'The Psychological Cost of Remote Monitoring', 'source': 'Future Work Review', 'url': 'https://research-source-f2.com', 'date': 'Dec 2025', 'summary': None, 'snippet': 'New research suggests that constantly monitored remote workers face higher mental health claims.'},
-                        {'id': str(uuid.uuid4()), 'title': 'Blockchain for Workers Comp Fraud Detection', 'source': 'FinTech Quarterly', 'url': 'https://research-source-f3.com', 'date': 'Nov 2025', 'summary': None, 'snippet': 'A new method using distributed ledger technology aims to dramatically reduce fraudulent workers compensation claims.'},
+                        {'id': str(uuid.uuid4()), 'title': 'AI-Powered Risk Assessment in Manufacturing', 'source': 'Safety Journal', 'url': 'https://research-source-f1.com', 'date': 'Jan 2026', 'summary': 'AI is being implemented in manufacturing to proactively identify and mitigate physical risks. This technology helps predict equipment failures and worker fatigue, leading to a significant drop in on-site accidents.', 'snippet': 'This paper explores how artificial intelligence can significantly enhance risk detection.'},
+                        {'id': str(uuid.uuid4()), 'title': 'The Psychological Cost of Remote Monitoring', 'source': 'Future Work Review', 'url': 'https://research-source-f2.com', 'date': 'Dec 2025', 'summary': 'Research suggests a correlation between constant digital monitoring of remote workers and an increase in mental health-related workers\' compensation claims. The study recommends implementing "disconnect" periods to reduce stress.', 'snippet': 'New research suggests that constantly monitored remote workers face higher mental health claims.'},
+                        {'id': str(uuid.uuid4()), 'title': 'Blockchain for Workers Comp Fraud Detection', 'source': 'FinTech Quarterly', 'url': 'https://research-source-f3.com', 'date': 'Nov 2025', 'summary': 'A new method using distributed ledger technology (blockchain) is being trialed to create immutable records for workers\' compensation claims, aiming to dramatically reduce fraudulent payouts and streamline auditing processes.', 'snippet': 'A new method using distributed ledger technology aims to dramatically reduce fraudulent workers compensation claims.'},
                     ]
 
                     # Apply URL cleaning to fallback data to ensure link robustness
@@ -255,36 +273,11 @@ def init_session_state():
         finally:
             st.session_state.is_loading = False
             
-# --- Action Handlers ---
+# --- Action Handlers (REMOVED handle_summarize) ---
 
-def handle_summarize(article_id: str):
-    """Generates and updates the summary for an article."""
-    
-    # Find the article in the main list
-    article = next((a for a in st.session_state.articles if a['id'] == article_id), None)
-
-    if not article:
-        st.error("Article not found.")
-        return
-
-    with st.spinner(f"Generating summary for {article['title']}..."):
-        # Call the SDK-based summary function
-        summary = generate_summary(article)
-
-    if summary and summary != "Summary generation failed.":
-        # Update the article in the main list
-        for i, a in enumerate(st.session_state.articles):
-            if a['id'] == article_id:
-                st.session_state.articles[i]['summary'] = summary
-                break
-        
-        st.toast("Summary complete!", icon='✨')
-        # Rerun to update the UI immediately
-        st.rerun()
-
-# --- Load More Handler (Now fetches new data) ---
+# --- Load More Handler (Now fetches new data and auto-summarizes) ---
 def handle_load_more():
-    """Fetches a new batch of 10 articles and increments the display count."""
+    """Fetches a new batch of 10 articles, auto-generates summaries, and increments the display count."""
     
     # Simple check to prevent double clicking during fetch
     if st.session_state.is_loading:
@@ -294,7 +287,7 @@ def handle_load_more():
     st.session_state.is_loading = True
     
     try:
-        with st.spinner("Searching the web for 10 more articles..."):
+        with st.spinner("Searching the web and generating summaries for 10 more articles..."):
             new_data = fetch_more_articles()
         
         if new_data and new_data.get('articles'):
@@ -329,13 +322,18 @@ def handle_load_more():
 # --- UI Components ---
 
 def render_article_card(article: Dict): 
-    """Renders a single detailed article card with buttons, using global CSS."""
+    """Renders a single detailed article card, now with auto-generated summaries and inline URL."""
     article_id = article['id']
     
+    # NEW: Inline URL with source and date
     st.markdown(
         f"""
         <div class="article-card-base">
-            <p style="font-size: 0.85rem; color: #8b949e; margin-bottom: 5px;">Source: {article.get('source', 'N/A')} | Date: {article.get('date', 'Recent')}</p>
+            <p style="font-size: 0.85rem; color: #8b949e; margin-bottom: 5px; overflow-wrap: break-word;">
+                <a href="{article['url']}" target="_blank" style="color: #8b949e; text-decoration: none;">
+                    Source: {article.get('source', 'N/A')} | Date: {article.get('date', 'Recent')} | URL: {article['url']}
+                </a>
+            </p>
             <a class="article-title-link" href="{article['url']}" target="_blank">{article['title']}</a>
             <p class="article-snippet">{article.get('snippet', 'Snippet not available.')}</p>
         </div>
@@ -343,7 +341,7 @@ def render_article_card(article: Dict):
         unsafe_allow_html=True
     )
 
-    # Display summary if available
+    # Display summary (now always auto-generated)
     if article.get('summary'):
         st.markdown(
             f"""
@@ -354,19 +352,7 @@ def render_article_card(article: Dict):
             unsafe_allow_html=True
         )
 
-    # Use Streamlit columns for buttons (only Summarize remains)
-    col_sum, col_spacer = st.columns([0.4, 0.6]) 
-    
-    with col_sum:
-        st.button(
-            "✨ Summarize",
-            # The key uses the globally unique UUID to prevent the StreamlitDuplicateElementKey error
-            key=f"sum_{article_id}",
-            on_click=handle_summarize,
-            args=(article_id,), 
-            type="primary"
-        )
-        
+    # Removed buttons column
     st.markdown("---") # Separator for neatness
 
 def render_home_tab(articles: List[Dict], insights: List[str]):
